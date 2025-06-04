@@ -8,7 +8,9 @@ const {
     StringSelectMenuOptionBuilder,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    PermissionsBitField,
+    ChannelType
 } = require('discord.js');
 require('dotenv').config();
 
@@ -168,23 +170,138 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 
 
-    // 4) Handle the Backpack modal submission
-    if (interaction.isModalSubmit() && interaction.customId === 'backpackModal') {
-        const location = interaction.fields.getTextInputValue('backpackLocation');
-        const duration = interaction.fields.getTextInputValue('backpackDuration');
-        const dates = interaction.fields.getTextInputValue('backpackDates');
-        const spots = interaction.fields.getTextInputValue('backpackSpots') || 'N/A';
+// 4) Handle the Backpack modal submission
+if (interaction.isModalSubmit() && interaction.customId === 'backpackModal') {
+    // 4a) Extract field values
+    const location = interaction.fields.getTextInputValue('backpackLocation');
+    const duration = interaction.fields.getTextInputValue('backpackDuration');
+    const dates = interaction.fields.getTextInputValue('backpackDates');
+    const spots = interaction.fields.getTextInputValue('backpackSpots') || 'N/A';
 
-        return interaction.reply({
-            content:
-                `**New Backpack Trip Request**\n` +
-                `• **Location:** ${location}\n` +
-                `• **Duration:** ${duration}\n` +
-                `• **Dates:** ${dates}\n` +
-                `• **# of Spots:** ${spots}`,
-            ephemeral: false
+    // 4b) Defer reply so we have time to create role + channel
+    await interaction.deferReply({ ephemeral: true });
+
+    const guild = interaction.guild;
+    const organizer = interaction.member; // the GuildMember who submitted
+
+    // 4c) Build sanitized base name from location + dates
+    const sanitize = (str) => {
+      return str
+        .toLowerCase()
+        .replace(/[\/––—\s]+/g, '-')        // slashes, dashes, whitespace → hyphens
+        .replace(/[^a-z0-9-]/g, '')         // strip out anything not alphanumeric or hyphen
+        .slice(0, 50);                      // trim to 50 chars
+    };
+    const safeLocation = sanitize(location);
+    const safeDates    = sanitize(dates);
+    const baseName = `${safeLocation}-${safeDates}`; // e.g. "mount-rainier-07-10-07-13"
+
+    // 4d) Ensure there's a “Backpacking Trips” category (create if missing)
+    let category = guild.channels.cache.find(
+      (ch) => ch.name === 'Backpacking Trips' && ch.type === ChannelType.GuildCategory
+    );
+    if (!category) {
+      try {
+        category = await guild.channels.create({
+          name: 'Backpacking Trips',
+          type: ChannelType.GuildCategory,
+          reason: 'Category for all backpacking trip channels'
         });
+      } catch (err) {
+        console.error('Failed to create "Backpacking Trips" category:', err);
+        return interaction.editReply({
+          content: 'Could not create or find the “Backpacking Trips” category. Please check my permissions.',
+        });
+      }
     }
+
+    // 4e) Create a new Role named "trip-<baseName>"
+    let tripRole;
+    try {
+      tripRole = await guild.roles.create({
+        name: `trip-${baseName}`,
+        permissions: [],   // no special perms
+        reason: `Backpack trip created by ${organizer.user.tag}`
+      });
+    } catch (err) {
+      console.error('Failed to create role:', err);
+      return interaction.editReply({
+        content: '❌ I could not create the trip role. Please check my permissions.',
+      });
+    }
+
+    // 4f) Create a new text channel under “Backpacking Trips”
+    let tripChannel;
+    try {
+      tripChannel = await guild.channels.create({
+        name: `backpack-${baseName}`,
+        type: ChannelType.GuildText,
+        parent: category.id,
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            deny: [PermissionsBitField.Flags.ViewChannel]
+          },
+          {
+            id: tripRole.id,
+            allow: [
+              PermissionsBitField.Flags.ViewChannel,
+              PermissionsBitField.Flags.SendMessages,
+              PermissionsBitField.Flags.ReadMessageHistory
+            ]
+          }
+        ],
+        topic: `Backpacking trip to ${location} (${dates})`,
+        reason: `Private channel for backpack trip created by ${organizer.user.tag}`
+      });
+    } catch (err) {
+      console.error('Failed to create channel:', err);
+      // Clean up role if channel creation failed
+      try { await tripRole.delete('Cleaning up role after channel creation failed'); } catch {}
+      return interaction.editReply({
+        content: '❌ I could not create the trip channel. Please check my permissions.',
+      });
+    }
+
+    // 4g) Assign the new role to the organizer so they see the channel
+    try {
+      await organizer.roles.add(tripRole.id);
+    } catch (err) {
+      console.error('Failed to assign role to organizer:', err);
+      // We can still proceed even if this fails
+    }
+
+    // 4h) Send a welcome message inside the new channel
+    try {
+      await tripChannel.send({
+        content:
+          `**Backpacking Trip: ${location}**\n` +
+          `• Duration: ${duration}\n` +
+          `• Dates: ${dates}\n` +
+          `• # of Spots: ${spots}\n` +
+          `• Organizer: <@${organizer.id}>\n\n` +
+          `Welcome! Only members with the \`${tripRole.name}\` role can see and chat here.`
+      });
+    } catch (err) {
+      console.error('Failed to send welcome message in trip channel:', err);
+    }
+
+    // 4i) ALSO send a public announcement in the channel where /trip was used:
+    try {
+      const invokingChannel = interaction.channel; // where /trip was originally typed
+      const announceText = `🎒 **Backpacking trip in ${location} on ${dates}!**\nReact with 🎫 if interested!`;
+      const announcement = await invokingChannel.send({ content: announceText });
+      await announcement.react('🎫');
+    } catch (err) {
+      console.error('Failed to send or react to the public announcement:', err);
+    }
+
+    // 4j) Finally, edit the deferred reply to confirm success
+    return interaction.editReply({
+      content: `Your private backpack channel has been created: <#${tripChannel.id}>.\n` +
+               `The role <@&${tripRole.id}> was assigned to you.`
+    });
+  }
 });
 
 client.login(process.env.BOT_TOKEN);
